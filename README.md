@@ -15,7 +15,7 @@ Each analysis directory has the same layout. Data folders are not tracked in git
 
 ```
 <Analysis>/
-  <script>.py
+  01_SDM.py
   README.md
   1_Input_from_chorus/      files exported from Chorus
   2_Other_inputs/           other inputs (e.g. Raster_covariates/*.tif for Occurrence)

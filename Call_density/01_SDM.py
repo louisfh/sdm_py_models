@@ -11,7 +11,7 @@ For each species and point:
    computed for every posterior draw.
 
 Run from the repository root:
-    .venv/bin/python Call_density/01_call_density.py
+    .venv/bin/python Call_density/01_SDM.py
 """
 
 from __future__ import annotations

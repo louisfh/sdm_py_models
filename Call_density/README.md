@@ -6,7 +6,7 @@ Call density per species and point from classifier scores and review labels.
 2. Calibrate every unreviewed window at the point with the posterior of that point's (a, b). Points without labelled windows are not calibrated.
 3. Call density at a point = (sum of labels + sum of calibrated probabilities) / number of windows, per posterior draw
 
-Run from the repository root: `.venv/bin/python Call_density/01_call_density.py`
+Run from the repository root: `.venv/bin/python Call_density/01_SDM.py`
 
 ## Inputs
 - `1_Input_from_chorus/Chorus_detection_history.csv`: reviewed windows, exported by Chorus. Used to fit the calibration.
