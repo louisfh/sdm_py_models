@@ -1,0 +1,25 @@
+# macOS
+.DS_Store
+
+# R session files
+.Rhistory
+.RData
+.Rproj.user/
+
+# Data: inputs, rasters, BirdNET/Chorus scores and generated outputs.
+# Folder structure is kept with .gitkeep files.
+**/1_Input_from_chorus/*
+**/2_Other_inputs/*
+**/3_Intermediate_outputs/*
+**/4_Expected_output/*
+!**/.gitkeep
+
+# Backstop for stray data files anywhere else
+*.tif
+*.tiff
+*.rds
+
+# Python
+.venv/
+__pycache__/
+*.nc

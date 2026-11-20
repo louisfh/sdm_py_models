@@ -1,0 +1,8 @@
+# Python dependencies for Occurrence/01_SDM.py (tested with Python 3.12)
+numpy>=2.0
+pandas>=2.2
+pymc>=5.20
+arviz>=0.20
+rasterio>=1.4
+netCDF4>=1.7
+scipy>=1.13
