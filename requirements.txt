@@ -6,3 +6,4 @@ arviz>=0.20
 rasterio>=1.4
 netCDF4>=1.7
 scipy>=1.13
+pyarrow>=15
