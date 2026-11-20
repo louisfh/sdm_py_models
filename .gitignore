@@ -6,7 +6,7 @@
 .RData
 .Rproj.user/
 
-# Data: inputs, rasters, BirdNET/Chorus scores and generated outputs.
+# Data: inputs, rasters, classifier scores and generated outputs.
 # Folder structure is kept with .gitkeep files.
 **/1_Input_from_chorus/*
 **/2_Other_inputs/*

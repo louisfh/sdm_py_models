@@ -4,7 +4,7 @@ For each species:
 1. Fit P(call | score) = inverse_logit(a + b * logit(score)) to the reviewed
    windows in Chorus_detection_history.csv (confirmed = 1, rejected = 0).
 2. Apply the posterior of (a, b) to every unreviewed window in the species'
-   BirdNET score file.
+   classifier score file.
 3. Call density at a point = (sum of review labels + sum of calibrated
    probabilities of unreviewed windows) / number of windows at the point,
    computed for every posterior draw.
@@ -62,7 +62,7 @@ PRIOR_SD = 2.5
 # labels; they are treated as unreviewed windows and calibrated from their score.
 LABELS = {"confirmed": 1, "rejected": 0}
 
-# BirdNET output: 1-minute recordings split into 3-second windows (20 per file).
+# Classifier score files: 1-minute recordings split into 3-second windows (20 per file).
 # Windows with confidence below MIN_LISTED_CONFIDENCE are not listed in the
 # score files; they are assigned UNLISTED_CONFIDENCE.
 WINDOW_SECONDS = 3

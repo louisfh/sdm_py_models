@@ -5,7 +5,7 @@ Code that is run on bird detection data exported from Chorus.
 Each top-level directory is one type of analysis:
 
 - `Occurrence/`: species occupancy and logistic regression models, projected over raster covariates
-- `Call_density/`: call density per species and point from BirdNET scores and review labels
+- `Call_density/`: call density per species and point from classifier scores and review labels
 - `Point-level/`: no code yet
 - `Richness/`: no code yet
 
@@ -38,19 +38,19 @@ Each analysis directory has the same layout. Data folders are not tracked in git
 | `recording_datetime` | `YYYY-MM-DDTHH:MM:SS` |
 | `detection_start_seconds`, `detection_end_seconds` | window within the recording |
 | `detection_method` | e.g. `classifier` |
-| `model_name`, `model_version` | e.g. `birdnet`, `2.4` |
+| `model_name`, `model_version` | classifier name and version |
 | `score` | classifier score (0 to 1) |
 | `review_status` | `confirmed`, `rejected`, `uncertain` or empty (unreviewed) |
 | `reviewer` | reviewer initials |
 | `license` | licence |
 
-`Unlabelled_scores/<Species>_<project>.csv` (Call_density only): BirdNET scores for every listed 3 s window of every recording, one file per species. These files are not yet exported by Chorus.
+`Unlabelled_scores/<Species>_<project>.csv` (Call_density only): classifier scores for every listed 3 s window of every recording, one file per species. These files are not yet exported by Chorus.
 
 | Column | Content |
 |---|---|
 | `Start (s)`, `End (s)` | window within the recording |
 | `Scientific name`, `Common name` | species |
-| `Confidence` | BirdNET confidence (0 to 1); windows below 0.0001 are not listed |
+| `Confidence` | classifier score (0 to 1); windows below 0.0001 are not listed |
 | `File` | recording path; the file name matches `filename` in `Chorus_detection_history.csv` |
 | `site` | site number |
 | `project` | `Calima` or `San Carlos` |
