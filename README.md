@@ -11,7 +11,7 @@ Each top-level directory is one type of analysis:
 
 ## Directory structure
 
-Each analysis directory has the same layout. Data folders are not tracked in git.
+Each analysis directory has the same layout. Data folders are not tracked in git, except `Occurrence/2_Other_inputs/Raster_covariates`.
 
 ```
 <Analysis>/

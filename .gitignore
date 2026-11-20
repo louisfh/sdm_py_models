@@ -23,3 +23,7 @@
 .venv/
 __pycache__/
 *.nc
+
+# Covariate rasters are tracked
+!Occurrence/2_Other_inputs/Raster_covariates/
+!Occurrence/2_Other_inputs/Raster_covariates/*.tif
