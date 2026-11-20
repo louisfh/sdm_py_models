@@ -4,11 +4,14 @@
   occupancy ~ raster covariates. Latent occupancy is marginalised out.
 - Logistic: Bernoulli logistic regression on naive occupancy, one row per
   site: y_i = 1 if the species was detected on any visit, else 0.
+- Beta-binomial: number of visits with a detection per site,
+  k_i ~ BetaBinomial(n_i, mu_i, phi), logit(mu_i) = X_i beta.
 
 Both models are projected over every raster cell with complete covariates.
 
-Both models are written in PyMC with logistic(0, 1) priors on every intercept
-and coefficient.
+All models are written in PyMC with logistic(0, 1) priors on every intercept
+and coefficient. The beta-binomial precision phi has an Exponential prior with
+mean PHI_PRIOR_MEAN.
 
 Run from the repository root:
     .venv/bin/python Occurrence/01_SDM.py
@@ -78,6 +81,7 @@ BFMI_THRESHOLD = 0.3
 PRIOR_MEAN = 0.0
 PRIOR_SCALE = 1.0
 PRIOR_SD = PRIOR_SCALE * np.pi / np.sqrt(3)
+PHI_PRIOR_MEAN = 10.0
 OVERLAP_THRESHOLD = 0.35
 
 # Posterior predictive check: share of replicated data sets with a statistic at
@@ -100,7 +104,11 @@ ARU_COORDINATES_FILE = INTERMEDIATE_DIR / "ARU_coordinates.csv"
 # CSV / GEOTIFF / NETCDF / JSON layout.
 OUTPUT_DIR = PROJECT_DIR / "4_Expected_output"
 COVARIATE_OUTPUT_DIR = OUTPUT_DIR / "Covariates"
-MODEL_OUTPUT_DIRS = {"occupancy": OUTPUT_DIR / "Occupancy", "logistic": OUTPUT_DIR / "Logistic"}
+MODEL_OUTPUT_DIRS = {
+    "occupancy": OUTPUT_DIR / "Occupancy",
+    "logistic": OUTPUT_DIR / "Logistic",
+    "beta_binomial": OUTPUT_DIR / "BetaBinomial",
+}
 MODEL_SUBDIRS = ["CSV", "GEOTIFF", "NETCDF", "JSON"]
 
 SITE_ID_COLUMNS = ["R_ID", "Project", "Site", "Latitude", "Longitude"]
@@ -171,6 +179,27 @@ def logistic_model(response: np.ndarray, covariates: np.ndarray) -> pm.Model:
     return model
 
 
+def beta_binomial_model(response: np.ndarray, covariates: np.ndarray) -> pm.Model:
+    """k_i ~ BetaBinomial(n_i, mu_i * phi, (1 - mu_i) * phi), logit(mu_i) = alpha + X_i beta.
+
+    k_i = visits with a detection, n_i = observed visits, one row per site.
+    mu_i is the expected proportion of visits with a detection; phi is the
+    precision (variance of the proportion = mu (1 - mu) / (1 + phi)). Sites
+    with no observed visits are left out.
+    """
+    n = (~np.isnan(response)).sum(axis=1)
+    k = np.nansum(response == 1, axis=1)
+    surveyed = n > 0
+    n, k, X = n[surveyed], k[surveyed], covariates[surveyed]
+    with pm.Model() as model:
+        intercept = pm.Logistic("intercept", mu=0, s=1)
+        beta = pm.Logistic("beta", mu=0, s=1, shape=X.shape[1])
+        phi = pm.Exponential("phi", lam=1.0 / PHI_PRIOR_MEAN)
+        mu = pm.math.invlogit(intercept + pm.math.dot(X, beta))
+        pm.BetaBinomial("k", n=n, alpha=mu * phi, beta=(1.0 - mu) * phi, observed=k)
+    return model
+
+
 def sample(model: pm.Model):
     """Sample a model, keeping warnings and turning errors into a message."""
     with warnings.catch_warnings(record=True) as caught:
@@ -193,17 +222,22 @@ def posterior_array(idata, name: str) -> np.ndarray:
     return np.asarray(idata.posterior[name].values)
 
 
-def prior_posterior_overlap(draws: np.ndarray) -> float:
+COEFFICIENT_PRIOR = stats.logistic(PRIOR_MEAN, PRIOR_SCALE)
+PHI_PRIOR = stats.expon(scale=PHI_PRIOR_MEAN)
+
+
+def prior_posterior_overlap(draws: np.ndarray, prior_distribution=COEFFICIENT_PRIOR) -> float:
     """Overlap of the prior density and a kernel estimate of the posterior density (0 to 1)."""
-    low = min(draws.min(), stats.logistic.ppf(0.0005, PRIOR_MEAN, PRIOR_SCALE))
-    high = max(draws.max(), stats.logistic.ppf(0.9995, PRIOR_MEAN, PRIOR_SCALE))
+    low = min(draws.min(), prior_distribution.ppf(0.0005))
+    high = max(draws.max(), prior_distribution.ppf(0.9995))
     grid = np.linspace(low, high, 4000)
-    prior = stats.logistic.pdf(grid, PRIOR_MEAN, PRIOR_SCALE)
+    prior = prior_distribution.pdf(grid)
     posterior = stats.gaussian_kde(draws)(grid)
     return float(np.trapezoid(np.minimum(prior, posterior), grid))
 
 
-def parameter_table(chains: dict[str, np.ndarray], terms: list[str], submodel: str) -> pd.DataFrame:
+def parameter_table(chains: dict[str, np.ndarray], terms: list[str], submodel: str,
+                    prior_distribution=COEFFICIENT_PRIOR) -> pd.DataFrame:
     """Posterior summary, MCMC diagnostics and prior-vs-posterior metrics per coefficient.
 
     chains maps term -> (chain, draw) array.
@@ -216,7 +250,7 @@ def parameter_table(chains: dict[str, np.ndarray], terms: list[str], submodel: s
     for term in terms:
         values = chains[term]
         flat = values.reshape(-1)
-        overlap = prior_posterior_overlap(flat)
+        overlap = prior_posterior_overlap(flat, prior_distribution)
         rows.append({
             "submodel": submodel,
             "term": term,
@@ -229,9 +263,9 @@ def parameter_table(chains: dict[str, np.ndarray], terms: list[str], submodel: s
             "ess_bulk": float(az.ess(values, method="bulk")),
             "ess_tail": float(az.ess(values, method="tail", prob=(0.05, 0.95))),
             "mcse_mean": float(az.mcse(values)),
-            "posterior_contraction": 1.0 - flat.var(ddof=1) / PRIOR_SD**2,
+            "posterior_contraction": 1.0 - flat.var(ddof=1) / prior_distribution.var(),
             "prior_posterior_overlap": overlap,
-            "posterior_shift": abs(flat.mean() - PRIOR_MEAN) / PRIOR_SD,
+            "posterior_shift": abs(flat.mean() - prior_distribution.mean()) / prior_distribution.std(),
             "overlap_above_threshold": overlap > OVERLAP_THRESHOLD,
         })
     return pd.DataFrame(rows)
@@ -273,18 +307,28 @@ def mcmc_diagnostics(idata, parameters: pd.DataFrame) -> dict:
 
 
 def posterior_predictive_check(response: np.ndarray, site_draws: np.ndarray,
-                               detection_draws: np.ndarray | None, seed: int) -> dict:
+                               detection_draws: np.ndarray | None, seed: int,
+                               phi_draws: np.ndarray | None = None) -> dict:
     """Compare observed detection totals with data replicated from the posterior.
 
     site_draws: sites x draws of psi (occupancy) or p (logistic).
     detection_draws: per-draw detection probability for the occupancy model, None for logistic.
-    Occupancy: total detections and sites with a detection. Logistic (site-level
-    naive occupancy): sites with a detection, over surveyed sites.
+    phi_draws: per-draw precision for the beta-binomial model (site_draws = mu).
+    Occupancy and beta-binomial: total detections and sites with a detection.
+    Logistic (site-level naive occupancy): sites with a detection, over surveyed sites.
     """
     rng = np.random.default_rng(seed)
     observed_visits = (~np.isnan(response)).sum(axis=1)
     detected_sites = int((np.nansum(response == 1, axis=1) > 0).sum())
-    if detection_draws is None:
+    if phi_draws is not None:
+        mu = np.clip(site_draws, 1e-9, 1 - 1e-9)
+        proportion = rng.beta(mu * phi_draws[None, :], (1.0 - mu) * phi_draws[None, :])
+        replicated = rng.binomial(observed_visits[:, None], proportion)
+        statistics = [
+            ("total_detections", np.nansum(response == 1), replicated.sum(axis=0)),
+            ("sites_with_detections", detected_sites, (replicated > 0).sum(axis=0)),
+        ]
+    elif detection_draws is None:
         surveyed = observed_visits > 0
         replicated = rng.random(site_draws[surveyed].shape) < site_draws[surveyed]
         statistics = [("sites_with_detections", detected_sites, replicated.sum(axis=0))]
@@ -616,8 +660,18 @@ def main() -> None:
             "prediction": "p: probability of naive occupancy, logit(p) = X * beta",
             "file_suffix": "p",
         },
+        "beta_binomial": {
+            "formula": "k_i ~ BetaBinomial(n_i, mu_i * phi, (1 - mu_i) * phi); logit(mu_i) = " + " + ".join(model_terms),
+            "description": "Beta-binomial regression, one row per surveyed site: k_i = visits with a detection, "
+                           "n_i = observed visits. mu_i = expected proportion of visits with a detection; "
+                           "phi = precision, Var(k_i / n_i) = mu_i (1 - mu_i) (n_i + phi) / (n_i (1 + phi)). "
+                           "Sites with no observed visits are left out.",
+            "prediction": "mu: expected proportion of visits with a detection, logit(mu) = X * beta",
+            "file_suffix": "mu",
+        },
     }
-    priors = "logistic(0, 1) on every intercept and coefficient"
+    priors = (f"logistic(0, 1) on every intercept and coefficient; beta-binomial phi ~ "
+              f"Exponential(mean {PHI_PRIOR_MEAN:g})")
     status_columns = ["detection_records", "observed_site_visits", "positive_detections", "missing_site_visits"]
     model_status = {
         name: pd.DataFrame({
@@ -699,7 +753,8 @@ def main() -> None:
             if counts["positive_detections"] == 0:
                 summary["status"] = "skipped_no_detections"
             else:
-                build = occupancy_model if model_name == "occupancy" else logistic_model
+                build = {"occupancy": occupancy_model, "logistic": logistic_model,
+                         "beta_binomial": beta_binomial_model}[model_name]
                 idata, fit_warnings, error = sample(build(response, project_covariates))
                 if idata is None:
                     summary["fit_error"] = error
@@ -730,12 +785,26 @@ def main() -> None:
                     else:
                         coefficients = np.concatenate([posterior_array(idata, "intercept")[..., None],
                                                        posterior_array(idata, "beta")], axis=-1)
+                        submodel = "naive_occupancy" if model_name == "logistic" else "proportion_detected"
                         parameters = parameter_table({term: coefficients[..., k] for k, term in enumerate(model_terms)},
-                                                     model_terms, "naive_occupancy")
+                                                     model_terms, submodel)
                         coefficient_draws = coefficients.reshape(-1, coefficients.shape[-1])
                         site_draws = probability_draws(project_covariates, coefficient_draws)
-                        site_predictions = summarise_draws(site_draws, "naive_occupancy_probability")
                         detection_draws = None
+                        if model_name == "logistic":
+                            site_predictions = summarise_draws(site_draws, "naive_occupancy_probability")
+                        else:
+                            phi = posterior_array(idata, "phi")
+                            parameters = pd.concat([parameters, parameter_table(
+                                {"phi": phi}, ["phi"], "precision", PHI_PRIOR)], ignore_index=True)
+                            phi_draws = phi.reshape(-1)
+                            observed_visits = (~np.isnan(response)).sum(axis=1)
+                            site_predictions = pd.concat([
+                                pd.DataFrame({"observed_proportion": np.where(
+                                    observed_visits > 0,
+                                    np.nansum(response == 1, axis=1) / np.maximum(observed_visits, 1), np.nan)}),
+                                summarise_draws(site_draws, "expected_proportion"),
+                            ], axis=1)
                     cell_draws = probability_draws(prediction_data, coefficient_draws)
 
                     diagnostics = mcmc_diagnostics(idata, parameters)
@@ -746,7 +815,9 @@ def main() -> None:
                         status_table.loc[index, column] = diagnostics[column]
                     status_table.loc[index, "terms_overlap_above_threshold"] = "; ".join(
                         diagnostics["terms_overlap_above_threshold"])
-                    ppc = posterior_predictive_check(response, site_draws, detection_draws, MCMC_SEED + index)
+                    ppc = posterior_predictive_check(
+                        response, site_draws, detection_draws, MCMC_SEED + index,
+                        phi_draws if model_name == "beta_binomial" else None)
                     for statistic, check in ppc.items():
                         status_table.loc[index, f"ppc_{statistic}_p"] = check["p_value"]
 
@@ -785,7 +856,9 @@ def main() -> None:
                                         "ess_threshold": ESS_THRESHOLD, "bfmi_threshold": BFMI_THRESHOLD,
                                         "overlap_threshold": OVERLAP_THRESHOLD},
                         "prior": {"distribution": "logistic", "location": PRIOR_MEAN, "scale": PRIOR_SCALE,
-                                  "sd": PRIOR_SD},
+                                  "sd": PRIOR_SD,
+                                  "phi": ({"distribution": "exponential", "mean": PHI_PRIOR_MEAN}
+                                          if model_name == "beta_binomial" else None)},
                         "posterior_predictive_check": ppc,
                         "parameter_estimates": parameters,
                         "fit_warnings": fit_warnings,

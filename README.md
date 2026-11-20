@@ -4,7 +4,7 @@ Code that is run on bird detection data exported from Chorus.
 
 Each top-level directory is one type of analysis:
 
-- `Occurrence/`: species occupancy and logistic regression models, projected over raster covariates
+- `Occurrence/`: occupancy, logistic regression and beta-binomial regression models per species, projected over raster covariates
 - `Call_density/`: call density per species and point from classifier scores and review labels
 - `Point-level/`: no code yet
 - `Richness/`: no code yet
