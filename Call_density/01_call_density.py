@@ -1,10 +1,11 @@
 """Estimate call density per species and point with Bayesian Platt scaling.
 
-For each species:
+For each species and point:
 1. Fit P(call | score) = inverse_logit(a + b * logit(score)) to the reviewed
-   windows in Chorus_detection_history.csv (confirmed = 1, rejected = 0).
-2. Apply the posterior of (a, b) to every unreviewed window in the species'
-   classifier score file.
+   windows at that point in Chorus_detection_history.csv (confirmed = 1,
+   rejected = 0). Each point has its own (a, b).
+2. Apply the posterior of that point's (a, b) to every unreviewed window at the
+   point in the species' classifier score file.
 3. Call density at a point = (sum of review labels + sum of calibrated
    probabilities of unreviewed windows) / number of windows at the point,
    computed for every posterior draw.
@@ -106,11 +107,16 @@ def read_scores(path: Path) -> pd.DataFrame:
     return scores[["species", "location_name", "filename", "start", "confidence"]]
 
 
-def platt_model(score: np.ndarray, label: np.ndarray) -> pm.Model:
-    with pm.Model() as model:
-        a = pm.Normal("a", mu=0, sigma=PRIOR_SD)
-        b = pm.Normal("b", mu=0, sigma=PRIOR_SD)
-        pm.Bernoulli("label", logit_p=a + b * logit(score), observed=label)
+def platt_model(score: np.ndarray, label: np.ndarray, point_index: np.ndarray, points: list[str]) -> pm.Model:
+    """One (a, b) per point with independent priors and no shared parameters.
+
+    The joint posterior factorises over points, so this is equivalent to a
+    separate fit at each point; it is sampled as one model per species.
+    """
+    with pm.Model(coords={"point": points}) as model:
+        a = pm.Normal("a", mu=0, sigma=PRIOR_SD, dims="point")
+        b = pm.Normal("b", mu=0, sigma=PRIOR_SD, dims="point")
+        pm.Bernoulli("label", logit_p=a[point_index] + b[point_index] * logit(score), observed=label)
     return model
 
 
@@ -138,10 +144,10 @@ def prior_posterior_overlap(draws: np.ndarray) -> float:
     return float(np.trapezoid(np.minimum(prior, posterior), grid))
 
 
-def parameter_table(idata) -> pd.DataFrame:
+def parameter_table(idata, point_position: int) -> pd.DataFrame:
     rows = []
     for term in ["a", "b"]:
-        values = np.asarray(idata.posterior[term].values)
+        values = np.asarray(idata.posterior[term].values)[:, :, point_position]
         flat = values.reshape(-1)
         rows.append({
             "term": term,
@@ -222,71 +228,82 @@ def main() -> None:
     for index, (species, path) in enumerate(sorted(score_tables.items())):
         reviewed = chorus[chorus["species"] == species]
         labelled = reviewed[reviewed["label"].notna()]
-        print(f"[{index + 1}/{len(score_tables)}] {species}: {len(labelled)} labelled windows, "
-              f"{int(labelled['label'].sum())} confirmed", flush=True)
-        status_row = {
-            "species": species, "score_file": path.name,
-            "reviewed_windows": len(reviewed), "labelled_windows": len(labelled),
-            "confirmed": int((labelled["label"] == 1).sum()), "rejected": int((labelled["label"] == 0).sum()),
-            "uncertain_or_unreviewed": int(reviewed["label"].isna().sum()),
-            "status": "", "fit_error": None,
-        }
-        if labelled["label"].nunique() < 2:
-            status_row["status"] = "skipped_labels_single_class"
-            platt_rows.append(status_row)
-            continue
-
-        idata, fit_warnings, error = sample(platt_model(labelled["score"].to_numpy(float),
-                                                        labelled["label"].to_numpy(int)))
-        if idata is None:
-            status_row.update(status="failed", fit_error=error)
-            platt_rows.append(status_row)
-            continue
-        parameters = parameter_table(idata)
-        diagnostics = sampler_diagnostics(idata)
-        converged = (parameters["rhat"].max() < RHAT_THRESHOLD
-                     and parameters[["ess_bulk", "ess_tail"]].min().min() >= ESS_THRESHOLD
-                     and diagnostics["divergent_transitions"] == 0
-                     and not diagnostics["max_treedepth_hits"]
-                     and diagnostics["min_bfmi"] >= BFMI_THRESHOLD)
-        status_row.update(
-            status="converged" if converged else "not_converged",
-            max_rhat=parameters["rhat"].max(),
-            min_ess_bulk=parameters["ess_bulk"].min(), min_ess_tail=parameters["ess_tail"].min(),
-            **diagnostics, fit_warnings="; ".join(fit_warnings),
-        )
-        idata.to_netcdf(NETCDF_DIR / f"{safe_name(species)}_platt_posterior.nc")
-        parameter_rows.append(parameters.assign(species=species)[["species"] + list(parameters.columns)])
-
-        a = np.asarray(idata.posterior["a"].values).reshape(-1)
-        b = np.asarray(idata.posterior["b"].values).reshape(-1)
-        curve = inverse_logit(a[:, None] + b[:, None] * logit(curve_scores)[None, :])
-        for column, score in enumerate(curve_scores):
-            curve_rows.append({"species": species, "score": score, **summarise(curve[:, column], "p_call")})
-
-        # Unreviewed windows: listed windows minus labelled ones, plus windows
-        # below the listing threshold in recordings that exist at the point.
         scores = read_scores(path).drop_duplicates(["filename", "start"])
         labelled_keys = set(zip(labelled["filename"], labelled["start"]))
         is_labelled = pd.Series([key in labelled_keys for key in zip(scores["filename"], scores["start"])],
                                 index=scores.index)
-        matched_labels = int(is_labelled.sum())
-        matched = labelled.merge(scores, on=["filename", "start"], how="inner")
-        status_row.update(labelled_windows_in_score_file=matched_labels,
-                          labelled_windows_not_in_score_file=len(labelled) - matched_labels,
-                          labelled_score_differs_from_score_file=int(
-                              (np.abs(matched["score"] - matched["confidence"]) > 0.001).sum()))
+        matched = labelled.merge(scores[["filename", "start", "confidence"]], on=["filename", "start"], how="left")
         unreviewed = scores[~is_labelled]
-        points = sorted(set(unreviewed["location_name"]) | set(labelled["location_name"]))
-        logit_unlisted = a + b * logit(np.array([UNLISTED_CONFIDENCE]))[0]
-        p_unlisted = inverse_logit(logit_unlisted)
+        points = sorted(set(unreviewed["location_name"]) | set(reviewed["location_name"]))
+        fitted_points = sorted(labelled["location_name"].unique())
+        print(f"[{index + 1}/{len(score_tables)}] {species}: {len(points)} points, {len(labelled)} labelled windows, "
+              f"{int(labelled['label'].sum())} confirmed", flush=True)
+
+        idata, fit_warnings, error, sampler = None, [], None, {}
+        if fitted_points:
+            point_index = pd.Index(fitted_points).get_indexer(labelled["location_name"])
+            idata, fit_warnings, error = sample(platt_model(
+                labelled["score"].to_numpy(float), labelled["label"].to_numpy(int), point_index, fitted_points))
+            if idata is not None:
+                sampler = sampler_diagnostics(idata)
+                idata.to_netcdf(NETCDF_DIR / f"{safe_name(species)}_platt_posterior.nc")
+
         for point in points:
-            point_scores = unreviewed[unreviewed["location_name"] == point]
+            point_reviewed = reviewed[reviewed["location_name"] == point]
             point_labels = labelled[labelled["location_name"] == point]
+            point_matched = matched[matched["location_name"] == point]
+            in_score_file = point_matched["confidence"].notna()
+            status_row = {
+                "species": species, "point": point, "score_file": path.name,
+                "reviewed_windows": len(point_reviewed), "labelled_windows": len(point_labels),
+                "confirmed": int((point_labels["label"] == 1).sum()),
+                "rejected": int((point_labels["label"] == 0).sum()),
+                "uncertain_or_unreviewed": int(point_reviewed["label"].isna().sum()),
+                "labelled_windows_in_score_file": int(in_score_file.sum()),
+                "labelled_windows_not_in_score_file": int((~in_score_file).sum()),
+                "labelled_score_differs_from_score_file": int(
+                    (np.abs(point_matched["score"] - point_matched["confidence"]) > 0.001).sum()),
+                "status": "", "fit_error": None,
+            }
+            if point not in fitted_points:
+                status_row["status"] = "no_labelled_windows"
+                platt_rows.append(status_row)
+                continue
+            if idata is None:
+                status_row.update(status="failed", fit_error=error)
+                platt_rows.append(status_row)
+                continue
+            position = fitted_points.index(point)
+            parameters = parameter_table(idata, position)
+            converged = (parameters["rhat"].max() < RHAT_THRESHOLD
+                         and parameters[["ess_bulk", "ess_tail"]].min().min() >= ESS_THRESHOLD
+                         and sampler["divergent_transitions"] == 0
+                         and not sampler["max_treedepth_hits"]
+                         and sampler["min_bfmi"] >= BFMI_THRESHOLD)
+            status_row.update(
+                status="converged" if converged else "not_converged",
+                max_rhat=parameters["rhat"].max(),
+                min_ess_bulk=parameters["ess_bulk"].min(), min_ess_tail=parameters["ess_tail"].min(),
+                **{f"species_model_{key}": value for key, value in sampler.items()},
+                fit_warnings="; ".join(fit_warnings),
+            )
+            parameter_rows.append(parameters.assign(species=species, point=point)[
+                ["species", "point"] + list(parameters.columns)])
+
+            a = np.asarray(idata.posterior["a"].values)[:, :, position].reshape(-1)
+            b = np.asarray(idata.posterior["b"].values)[:, :, position].reshape(-1)
+            curve = inverse_logit(a[:, None] + b[:, None] * logit(curve_scores)[None, :])
+            for column, score in enumerate(curve_scores):
+                curve_rows.append({"species": species, "point": point, "score": score,
+                                   **summarise(curve[:, column], "p_call")})
+
+            # Unreviewed windows: listed windows minus labelled ones, plus windows
+            # below the listing threshold in recordings that exist at the point.
+            point_scores = unreviewed[unreviewed["location_name"] == point]
             files = files_by_point.get(point, set())
             labelled_in_files = sum(1 for name in point_labels["filename"] if name in files)
-            windows_in_files = len(files) * WINDOWS_PER_FILE
-            unlisted = max(windows_in_files - len(point_scores) - labelled_in_files, 0)
+            unlisted = max(len(files) * WINDOWS_PER_FILE - len(point_scores) - labelled_in_files, 0)
+            p_unlisted = inverse_logit(a + b * logit(np.array([UNLISTED_CONFIDENCE]))[0])
             confidence_values, counts = np.unique(point_scores["confidence"].to_numpy(float), return_counts=True)
             calibrated = inverse_logit(a[:, None] + b[:, None] * logit(confidence_values)[None, :])
             expected_calls = calibrated @ counts + unlisted * p_unlisted + point_labels["label"].sum()
@@ -303,7 +320,7 @@ def main() -> None:
                 **summarise(expected_calls, "expected_calls"),
                 **summarise(expected_calls / total_windows, "call_density"),
             })
-        platt_rows.append(status_row)
+            platt_rows.append(status_row)
 
     pd.DataFrame(platt_rows).to_csv(CSV_DIR / "platt_status.csv", index=False)
     if parameter_rows:
@@ -311,7 +328,7 @@ def main() -> None:
         pd.DataFrame(curve_rows).to_csv(CSV_DIR / "calibration_curves.csv", index=False)
         pd.DataFrame(density_rows).to_csv(CSV_DIR / "call_density_by_point.csv", index=False)
     status = pd.DataFrame(platt_rows)["status"]
-    print(f"Species: {len(status)}; converged: {(status == 'converged').sum()}; "
+    print(f"Species x points: {len(status)}; converged: {(status == 'converged').sum()}; "
           f"not converged: {(status == 'not_converged').sum()}; other: {(~status.isin(['converged', 'not_converged'])).sum()}")
     print("Outputs written to:", OUTPUT_DIR)
 
