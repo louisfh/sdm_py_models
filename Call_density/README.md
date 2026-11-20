@@ -9,8 +9,24 @@ Call density per species and point from classifier scores and review labels.
 Run from the repository root: `.venv/bin/python Call_density/01_call_density.py`
 
 ## Inputs
-- `1_Input_from_chorus/Chorus_detection_history.csv`
-- `1_Input_from_chorus/Unlabelled_scores/<Species>_<project>.csv`: classifier scores per 3 s window (not yet exported by Chorus). Windows below 0.0001 are not listed; they are counted as 20 windows per 1-minute recording with confidence 0.00005.
+- `1_Input_from_chorus/Chorus_detection_history.csv`: reviewed windows, exported by Chorus. Used to fit the calibration.
+- `1_Input_from_chorus/Unlabelled_scores/*.csv`: classifier scores for all windows, used for the unreviewed windows. **These files are not yet exported by Chorus.** The script expects the format below.
+
+### Expected format of `Unlabelled_scores/*.csv`
+- One CSV per species, any file name ending in `.csv` (e.g. `<Species>_<project>.csv`)
+- One row per 3 s window of each 1-minute recording (20 windows per recording)
+- Windows with a score below 0.0001 may be left out; they are counted as windows with score 0.00005
+
+| Column | Content |
+|---|---|
+| `Start (s)` | window start in the recording, matched to `detection_start_seconds` |
+| `Scientific name` | species; one species per file, matching `scientific_name` |
+| `Confidence` | classifier score (0 to 1) |
+| `File` | recording path; the file name (after the last `/` or `\`) is matched to `filename` |
+| `site` | site number |
+| `project` | `Calima` or `San Carlos`; point = `<project>_<site>`, matching `location_name` |
+
+Other columns are ignored.
 
 ## Outputs (`4_Expected_output/`)
 - `CSV/call_density_by_point.csv`: expected calls and call density per species and point (mean, sd, 95% interval)
