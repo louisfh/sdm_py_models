@@ -2,8 +2,8 @@
 
 - Occupancy: single-season occupancy model, constant detection,
   occupancy ~ raster covariates. Latent occupancy is marginalised out.
-- Logistic: Bernoulli logistic regression with one row per observed
-  site-visit, no latent occupancy state and no site-level term.
+- Logistic: Bernoulli logistic regression on naive occupancy, one row per
+  site: y_i = 1 if the species was detected on any visit, else 0.
 
 Both models are projected over every raster cell with complete covariates.
 
@@ -156,10 +156,14 @@ def occupancy_model(response: np.ndarray, covariates: np.ndarray) -> pm.Model:
 
 
 def logistic_model(response: np.ndarray, covariates: np.ndarray) -> pm.Model:
-    """y_ij ~ Bernoulli(p_i), logit(p_i) = alpha + X_i beta, one row per observed visit."""
-    site_index, _ = np.nonzero(~np.isnan(response))
-    y = response[~np.isnan(response)].astype(int)
-    X = covariates[site_index]
+    """y_i ~ Bernoulli(p_i), logit(p_i) = alpha + X_i beta, one row per site.
+
+    y_i = max over observed visits (naive occupancy). Sites with no observed
+    visits are left out.
+    """
+    surveyed = (~np.isnan(response)).sum(axis=1) > 0
+    y = (np.nansum(response == 1, axis=1) > 0)[surveyed].astype(int)
+    X = covariates[surveyed]
     with pm.Model() as model:
         intercept = pm.Logistic("intercept", mu=0, s=1)
         beta = pm.Logistic("beta", mu=0, s=1, shape=X.shape[1])
@@ -274,19 +278,25 @@ def posterior_predictive_check(response: np.ndarray, site_draws: np.ndarray,
 
     site_draws: sites x draws of psi (occupancy) or p (logistic).
     detection_draws: per-draw detection probability for the occupancy model, None for logistic.
+    Occupancy: total detections and sites with a detection. Logistic (site-level
+    naive occupancy): sites with a detection, over surveyed sites.
     """
     rng = np.random.default_rng(seed)
     observed_visits = (~np.isnan(response)).sum(axis=1)
+    detected_sites = int((np.nansum(response == 1, axis=1) > 0).sum())
     if detection_draws is None:
-        replicated = rng.binomial(observed_visits[:, None], site_draws)
+        surveyed = observed_visits > 0
+        replicated = rng.random(site_draws[surveyed].shape) < site_draws[surveyed]
+        statistics = [("sites_with_detections", detected_sites, replicated.sum(axis=0))]
     else:
         occupied = rng.random(site_draws.shape) < site_draws
         replicated = rng.binomial(observed_visits[:, None], occupied * detection_draws[None, :])
+        statistics = [
+            ("total_detections", np.nansum(response == 1), replicated.sum(axis=0)),
+            ("sites_with_detections", detected_sites, (replicated > 0).sum(axis=0)),
+        ]
     checks = {}
-    for statistic, observed, replicate in [
-        ("total_detections", np.nansum(response == 1), replicated.sum(axis=0)),
-        ("sites_with_detections", int((np.nansum(response == 1, axis=1) > 0).sum()), (replicated > 0).sum(axis=0)),
-    ]:
+    for statistic, observed, replicate in statistics:
         p_value = float((replicate >= observed).mean())
         checks[statistic] = {
             "observed": int(observed),
@@ -599,10 +609,11 @@ def main() -> None:
             "file_suffix": "psi",
         },
         "logistic": {
-            "formula": "y_ij ~ Bernoulli(p_i); logit(p_i) = " + " + ".join(model_terms),
-            "description": "Logistic regression with one row per observed site-visit: y_ij ~ Bernoulli(p_i), "
-                           "logit(p_i) = X_i * beta. No latent occupancy state and no site-level term.",
-            "prediction": "p: fitted Bernoulli probability, logit(p) = X * beta",
+            "formula": "y_i ~ Bernoulli(p_i); logit(p_i) = " + " + ".join(model_terms),
+            "description": "Logistic regression on naive occupancy, one row per surveyed site: y_i = 1 if the "
+                           "species was detected on any observed visit, else 0; y_i ~ Bernoulli(p_i), "
+                           "logit(p_i) = X_i * beta. Sites with no observed visits are left out.",
+            "prediction": "p: probability of naive occupancy, logit(p) = X * beta",
             "file_suffix": "p",
         },
     }
@@ -720,10 +731,10 @@ def main() -> None:
                         coefficients = np.concatenate([posterior_array(idata, "intercept")[..., None],
                                                        posterior_array(idata, "beta")], axis=-1)
                         parameters = parameter_table({term: coefficients[..., k] for k, term in enumerate(model_terms)},
-                                                     model_terms, "detection_per_visit")
+                                                     model_terms, "naive_occupancy")
                         coefficient_draws = coefficients.reshape(-1, coefficients.shape[-1])
                         site_draws = probability_draws(project_covariates, coefficient_draws)
-                        site_predictions = summarise_draws(site_draws, "detection_probability")
+                        site_predictions = summarise_draws(site_draws, "naive_occupancy_probability")
                         detection_draws = None
                     cell_draws = probability_draws(prediction_data, coefficient_draws)
 
@@ -814,8 +825,8 @@ def main() -> None:
         fitted = table["status"].isin(["converged", "not_converged"])
         fitted_any |= bool(fitted.any())
         overlap = (table["terms_overlap_above_threshold"] != "").sum()
-        ppc_outside = (~table["ppc_sites_with_detections_p"].between(*PPC_BOUNDS)
-                       | ~table["ppc_total_detections_p"].between(*PPC_BOUNDS))[fitted].sum()
+        ppc_columns = table[["ppc_sites_with_detections_p", "ppc_total_detections_p"]]
+        ppc_outside = ((ppc_columns < PPC_BOUNDS[0]) | (ppc_columns > PPC_BOUNDS[1])).any(axis=1)[fitted].sum()
         print(f"{model_name}: fitted {fitted.sum()} of {len(species)} species; "
               f"converged: {(table['status'] == 'converged').sum()}; "
               f"failed: {table['status'].str.startswith('failed').sum()}; "

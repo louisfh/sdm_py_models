@@ -3,7 +3,7 @@
 Fits two Bayesian models per species (PyMC) and projects them over the covariate rasters.
 
 - Occupancy: z_i ~ Bernoulli(psi_i), y_ij ~ Bernoulli(z_i p), logit(psi_i) = X_i beta, constant p
-- Logistic: y_ij ~ Bernoulli(p_i), logit(p_i) = X_i beta, one row per site-visit
+- Logistic: y_i ~ Bernoulli(p_i), logit(p_i) = X_i beta, one row per site; y_i = naive occupancy (1 if detected on any visit, else 0). Sites with no observed visits are left out.
 - Priors: logistic(0, 1) on every intercept and coefficient
 
 Run from the repository root: `.venv/bin/python Occurrence/01_SDM.py`
