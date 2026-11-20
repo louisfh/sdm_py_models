@@ -1,7 +1,8 @@
 """Estimate call density per species and point with Bayesian Platt scaling.
 
 For each species and point:
-1. Fit P(call | score) = inverse_logit(a + b * logit(score)) to the reviewed
+Scores are on the logit scale.
+1. Fit P(call | score) = inverse_logit(a + b * score) to the reviewed
    windows at that point in Chorus_detection_history.csv (confirmed = 1,
    rejected = 0). Each point has its own (a, b).
 2. Apply the posterior of that point's (a, b) to every unreviewed window at the
@@ -63,14 +64,18 @@ PRIOR_SD = 2.5
 # labels; they are treated as unreviewed windows and calibrated from their score.
 LABELS = {"confirmed": 1, "rejected": 0}
 
-# Classifier score files: 1-minute recordings split into 3-second windows (20 per file).
-# Windows with confidence below MIN_LISTED_CONFIDENCE are not listed in the
-# score files; they are assigned UNLISTED_CONFIDENCE.
-WINDOW_SECONDS = 3
-WINDOWS_PER_FILE = 20
-MIN_LISTED_CONFIDENCE = 0.0001
-UNLISTED_CONFIDENCE = 0.00005
-SCORE_CLIP = (0.00005, 0.99995)  # scores are clipped to this range before logit
+# Scores. Unlabelled score files: column "Score", logit scale, one row for every
+# window. Chorus_detection_history.csv: column "score", on the scale set by
+# CHORUS_SCORE_SCALE ("logit", or "confidence" for 0 to 1 scores, which are
+# converted with logit(c) = log(c / (1 - c)) after clipping to CONFIDENCE_CLIP).
+CHORUS_SCORE_SCALE = "confidence"
+CONFIDENCE_CLIP = (0.00005, 0.99995)
+# Unlabelled scores are rounded to SCORE_ROUNDING (logit units) when summing
+# calibrated probabilities.
+SCORE_ROUNDING = 0.01
+# Labelled windows whose Chorus score and unlabelled score differ by more than
+# SCORE_TOLERANCE (logit units) are counted in platt_status.csv.
+SCORE_TOLERANCE = 0.01
 
 PROJECT_DIR = Path(__file__).resolve().parent
 CHORUS_FILE = PROJECT_DIR / "1_Input_from_chorus" / "Chorus_detection_history.csv"
@@ -79,7 +84,7 @@ OUTPUT_DIR = PROJECT_DIR / "4_Expected_output"
 CSV_DIR = OUTPUT_DIR / "CSV"
 NETCDF_DIR = OUTPUT_DIR / "NETCDF"
 
-SCORE_COLUMNS = ["Start (s)", "Scientific name", "Confidence", "File", "site", "project"]
+SCORE_COLUMNS = ["Start (s)", "Scientific name", "Score", "File", "site", "project"]
 PROJECTS = {"Calima": "Calima", "San Carlos": "San_Carlos", "San_Carlos": "San_Carlos"}
 
 
@@ -87,8 +92,8 @@ def fail(message: str) -> None:
     sys.exit("Error: " + message)
 
 
-def logit(score: np.ndarray) -> np.ndarray:
-    clipped = np.clip(score, *SCORE_CLIP)
+def logit(confidence: np.ndarray) -> np.ndarray:
+    clipped = np.clip(confidence, *CONFIDENCE_CLIP)
     return np.log(clipped) - np.log1p(-clipped)
 
 
@@ -97,14 +102,18 @@ def inverse_logit(x: np.ndarray) -> np.ndarray:
 
 
 def read_scores(path: Path) -> pd.DataFrame:
+    header = pd.read_csv(path, nrows=0).columns
+    missing = [column for column in SCORE_COLUMNS if column not in header]
+    if missing:
+        fail(f"{path.name} is missing columns: {', '.join(missing)} (expected: {', '.join(SCORE_COLUMNS)})")
     scores = pd.read_csv(path, usecols=SCORE_COLUMNS, engine="pyarrow")
     scores["filename"] = scores["File"].str.replace("\\", "/", regex=False).str.split("/").str[-1]
     project = scores["project"].map(PROJECTS)
     if project.isna().any():
         fail(f"Unknown project names in {path.name}: {sorted(scores.loc[project.isna(), 'project'].unique())}")
     scores["location_name"] = project + "_" + scores["site"].astype(str)
-    scores = scores.rename(columns={"Start (s)": "start", "Confidence": "confidence", "Scientific name": "species"})
-    return scores[["species", "location_name", "filename", "start", "confidence"]]
+    scores = scores.rename(columns={"Start (s)": "start", "Score": "logit_score", "Scientific name": "species"})
+    return scores[["species", "location_name", "filename", "start", "logit_score"]]
 
 
 def platt_model(score: np.ndarray, label: np.ndarray, point_index: np.ndarray, points: list[str]) -> pm.Model:
@@ -116,7 +125,7 @@ def platt_model(score: np.ndarray, label: np.ndarray, point_index: np.ndarray, p
     with pm.Model(coords={"point": points}) as model:
         a = pm.Normal("a", mu=0, sigma=PRIOR_SD, dims="point")
         b = pm.Normal("b", mu=0, sigma=PRIOR_SD, dims="point")
-        pm.Bernoulli("label", logit_p=a[point_index] + b[point_index] * logit(score), observed=label)
+        pm.Bernoulli("label", logit_p=a[point_index] + b[point_index] * score, observed=label)
     return model
 
 
@@ -208,23 +217,23 @@ def main() -> None:
     chorus["review_status"] = chorus["review_status"].fillna("").str.strip().str.lower()
     chorus["label"] = chorus["review_status"].map(LABELS)
     chorus = chorus.rename(columns={"scientific_name": "species", "detection_start_seconds": "start"})
+    if CHORUS_SCORE_SCALE == "confidence":
+        chorus["logit_score"] = logit(chorus["score"].to_numpy(float))
+    elif CHORUS_SCORE_SCALE == "logit":
+        chorus["logit_score"] = chorus["score"].astype(float)
+    else:
+        fail('CHORUS_SCORE_SCALE must be "logit" or "confidence"')
 
-    # Recording effort: a recording file exists at a point if it is listed in
-    # any species' score file for that point.
     print("Reading score files", flush=True)
     score_tables = {}
-    files_by_point = {}
     for path in score_files:
-        scores = read_scores(path)
-        species_in_file = scores["species"].unique()
+        species_in_file = pd.read_csv(path, usecols=["Scientific name"], engine="pyarrow")["Scientific name"].unique()
         if len(species_in_file) != 1:
             fail(f"{path.name} must contain exactly one species; found {len(species_in_file)}")
         score_tables[species_in_file[0]] = path
-        for point, files in scores.groupby("location_name")["filename"]:
-            files_by_point.setdefault(point, set()).update(files.unique())
 
     platt_rows, parameter_rows, density_rows, curve_rows = [], [], [], []
-    curve_scores = np.round(np.linspace(0, 1, 101), 2)
+    curve_scores = np.round(np.arange(-10, 10.01, 0.1), 1)
     for index, (species, path) in enumerate(sorted(score_tables.items())):
         reviewed = chorus[chorus["species"] == species]
         labelled = reviewed[reviewed["label"].notna()]
@@ -232,7 +241,8 @@ def main() -> None:
         labelled_keys = set(zip(labelled["filename"], labelled["start"]))
         is_labelled = pd.Series([key in labelled_keys for key in zip(scores["filename"], scores["start"])],
                                 index=scores.index)
-        matched = labelled.merge(scores[["filename", "start", "confidence"]], on=["filename", "start"], how="left")
+        matched = labelled.merge(scores[["filename", "start", "logit_score"]], on=["filename", "start"],
+                                 how="left", suffixes=("", "_score_file"))
         unreviewed = scores[~is_labelled]
         points = sorted(set(unreviewed["location_name"]) | set(reviewed["location_name"]))
         fitted_points = sorted(labelled["location_name"].unique())
@@ -243,7 +253,7 @@ def main() -> None:
         if fitted_points:
             point_index = pd.Index(fitted_points).get_indexer(labelled["location_name"])
             idata, fit_warnings, error = sample(platt_model(
-                labelled["score"].to_numpy(float), labelled["label"].to_numpy(int), point_index, fitted_points))
+                labelled["logit_score"].to_numpy(float), labelled["label"].to_numpy(int), point_index, fitted_points))
             if idata is not None:
                 sampler = sampler_diagnostics(idata)
                 idata.to_netcdf(NETCDF_DIR / f"{safe_name(species)}_platt_posterior.nc")
@@ -252,7 +262,7 @@ def main() -> None:
             point_reviewed = reviewed[reviewed["location_name"] == point]
             point_labels = labelled[labelled["location_name"] == point]
             point_matched = matched[matched["location_name"] == point]
-            in_score_file = point_matched["confidence"].notna()
+            in_score_file = point_matched["logit_score_score_file"].notna()
             status_row = {
                 "species": species, "point": point, "score_file": path.name,
                 "reviewed_windows": len(point_reviewed), "labelled_windows": len(point_labels),
@@ -262,7 +272,8 @@ def main() -> None:
                 "labelled_windows_in_score_file": int(in_score_file.sum()),
                 "labelled_windows_not_in_score_file": int((~in_score_file).sum()),
                 "labelled_score_differs_from_score_file": int(
-                    (np.abs(point_matched["score"] - point_matched["confidence"]) > 0.001).sum()),
+                    (np.abs(point_matched["logit_score"] - point_matched["logit_score_score_file"])
+                     > SCORE_TOLERANCE).sum()),
                 "status": "", "fit_error": None,
             }
             if point not in fitted_points:
@@ -292,31 +303,27 @@ def main() -> None:
 
             a = np.asarray(idata.posterior["a"].values)[:, :, position].reshape(-1)
             b = np.asarray(idata.posterior["b"].values)[:, :, position].reshape(-1)
-            curve = inverse_logit(a[:, None] + b[:, None] * logit(curve_scores)[None, :])
+            curve = inverse_logit(a[:, None] + b[:, None] * curve_scores[None, :])
             for column, score in enumerate(curve_scores):
-                curve_rows.append({"species": species, "point": point, "score": score,
+                curve_rows.append({"species": species, "point": point, "logit_score": score,
                                    **summarise(curve[:, column], "p_call")})
 
-            # Unreviewed windows: listed windows minus labelled ones, plus windows
-            # below the listing threshold in recordings that exist at the point.
+            # Unreviewed windows: every window in the score file at this point
+            # that is not a labelled window.
             point_scores = unreviewed[unreviewed["location_name"] == point]
-            files = files_by_point.get(point, set())
-            labelled_in_files = sum(1 for name in point_labels["filename"] if name in files)
-            unlisted = max(len(files) * WINDOWS_PER_FILE - len(point_scores) - labelled_in_files, 0)
-            p_unlisted = inverse_logit(a + b * logit(np.array([UNLISTED_CONFIDENCE]))[0])
-            confidence_values, counts = np.unique(point_scores["confidence"].to_numpy(float), return_counts=True)
-            calibrated = inverse_logit(a[:, None] + b[:, None] * logit(confidence_values)[None, :])
-            expected_calls = calibrated @ counts + unlisted * p_unlisted + point_labels["label"].sum()
-            total_windows = len(point_scores) + unlisted + len(point_labels)
+            rounded = np.round(point_scores["logit_score"].to_numpy(float) / SCORE_ROUNDING) * SCORE_ROUNDING
+            score_values, counts = np.unique(rounded, return_counts=True)
+            calibrated = inverse_logit(a[:, None] + b[:, None] * score_values[None, :])
+            expected_calls = calibrated @ counts + point_labels["label"].sum()
+            total_windows = len(point_scores) + len(point_labels)
             density_rows.append({
                 "species": species,
                 "point": point,
-                "recording_files": len(files),
+                "recording_files": point_scores["filename"].nunique(),
                 "total_windows": total_windows,
                 "labelled_windows": len(point_labels),
                 "labelled_confirmed": int(point_labels["label"].sum()),
-                "unreviewed_listed_windows": len(point_scores),
-                "unreviewed_unlisted_windows": unlisted,
+                "unreviewed_windows": len(point_scores),
                 **summarise(expected_calls, "expected_calls"),
                 **summarise(expected_calls / total_windows, "call_density"),
             })

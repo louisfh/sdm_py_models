@@ -44,17 +44,16 @@ Each analysis directory has the same layout. Data folders are not tracked in git
 | `reviewer` | reviewer initials |
 | `license` | licence |
 
-`Unlabelled_scores/<Species>_<project>.csv` (Call_density only): classifier scores for every listed 3 s window of every recording, one file per species. These files are not yet exported by Chorus.
+`Unlabelled_scores/*.csv` (Call_density only): logit-scale classifier scores for every 3 s window of every recording, one file per species, no windows left out. These files are not yet exported by Chorus; the script expects this format:
 
 | Column | Content |
 |---|---|
-| `Start (s)`, `End (s)` | window within the recording |
-| `Scientific name`, `Common name` | species |
-| `Confidence` | classifier score (0 to 1); windows below 0.0001 are not listed |
+| `Start (s)` | window start in the recording |
+| `Scientific name` | species (one per file) |
+| `Score` | classifier score on the logit scale |
 | `File` | recording path; the file name matches `filename` in `Chorus_detection_history.csv` |
 | `site` | site number |
 | `project` | `Calima` or `San Carlos` |
-| `date`, `month`, `day`, `date_val`, `block_vals`, `Block` | recording date fields |
 
 ## 2_Other_inputs/Raster_covariates (Occurrence)
 
